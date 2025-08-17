@@ -97,15 +97,6 @@ make start-controller
 └── .github/                  # CI/CD workflows
 ```
 
-## Documentation
-
-- [Architecture Guide](docs/architecture.md)
-- [Installation Guide](docs/installation.md)
-- [Configuration Reference](docs/configuration.md)
-- [Security Best Practices](docs/security.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [API Reference](docs/api.md)
-
 ## Contributing
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
