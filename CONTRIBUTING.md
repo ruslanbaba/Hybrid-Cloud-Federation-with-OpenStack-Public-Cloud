@@ -11,6 +11,7 @@ This project adheres to enterprise standards of professionalism and collaboratio
 - Maintain confidentiality of sensitive information
 - Follow security best practices in all contributions
 - Respect intellectual property and licensing requirements
+- Create individual branch 
 
 ## Getting Started
 
@@ -149,7 +150,6 @@ All pull requests must:
    - Use data sources for existing resources
 
 2. **Naming Conventions**
-   - Use kebab-case for resource names
    - Include environment and purpose in names
    - Use descriptive variable names
 
@@ -348,15 +348,7 @@ For security vulnerabilities:
 
 - **GitHub Issues**: Bug reports, feature requests
 - **GitHub Discussions**: General questions, ideas
-- **Slack #federation-dev**: Real-time collaboration
-- **Email lists**: Announcements, security issues
 
-### Meeting Schedule
-
-- **Weekly Standups**: Mondays at 9:00 AM UTC
-- **Sprint Planning**: Every two weeks
-- **Architecture Reviews**: Monthly
-- **Security Reviews**: Quarterly
 
 ## Recognition
 
