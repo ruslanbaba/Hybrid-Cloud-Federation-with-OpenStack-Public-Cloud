@@ -1,1 +1,1 @@
-# Hybrid-Cloud-Federation-with-OpenStack-Public-Cloud
+# Hybrid Cloud Federation with OpenStack & Public Cloud
