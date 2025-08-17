@@ -1,0 +1,480 @@
+name: Enterprise Hybrid Cloud Federation CI/CD
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+    paths:
+      - 'terraform/**'
+      - 'ansible/**'
+      - 'controller/**'
+      - 'policies/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * *'  # Daily security scans at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      skip_tests:
+        description: 'Skip tests and validation'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TF_VERSION: '1.6.0'
+  ANSIBLE_VERSION: '2.15.0'
+  GO_VERSION: '1.21.0'
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+  ARM_USE_MSI: true
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  # Security and compliance scanning
+  security-scan:
+    name: Security & Compliance Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Terraform security scan with Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ./terraform
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          download_external_modules: true
+
+      - name: OPA Policy Testing
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/v0.56.0/opa_linux_amd64_static
+          chmod +x opa
+          ./opa fmt --diff policies/opa/
+          ./opa test policies/opa/
+
+      - name: Ansible security scan
+        run: |
+          pip install ansible-lint
+          ansible-lint ansible/
+
+  # Code quality and testing
+  code-quality:
+    name: Code Quality & Testing
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [terraform, ansible, controller]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        if: matrix.component == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt check
+        if: matrix.component == 'terraform'
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+
+      - name: Terraform validate
+        if: matrix.component == 'terraform'
+        run: |
+          cd terraform
+          find . -name "*.tf" -exec dirname {} \; | sort -u | while read dir; do
+            echo "Validating $dir"
+            (cd "$dir" && terraform init -backend=false && terraform validate)
+          done
+
+      - name: Setup Python for Ansible
+        if: matrix.component == 'ansible'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Ansible
+        if: matrix.component == 'ansible'
+        run: |
+          pip install ansible==${{ env.ANSIBLE_VERSION }}
+          pip install ansible-lint molecule[docker]
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Ansible syntax check
+        if: matrix.component == 'ansible'
+        run: |
+          cd ansible
+          find . -name "*.yml" -o -name "*.yaml" | xargs ansible-playbook --syntax-check
+
+      - name: Molecule test
+        if: matrix.component == 'ansible'
+        run: |
+          cd ansible/roles/openstack-federation
+          molecule test
+
+      - name: Setup Go
+        if: matrix.component == 'controller'
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Go mod tidy check
+        if: matrix.component == 'controller'
+        run: |
+          cd controller/src
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Go vet
+        if: matrix.component == 'controller'
+        run: |
+          cd controller/src
+          go vet ./...
+
+      - name: Go test
+        if: matrix.component == 'controller'
+        run: |
+          cd controller/src
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        if: matrix.component == 'controller'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./controller/src/coverage.out
+          flags: controller
+          name: controller-coverage
+
+  # Infrastructure validation
+  infrastructure-validation:
+    name: Infrastructure Validation
+    runs-on: ubuntu-latest
+    needs: [security-scan, code-quality]
+    if: github.event_name != 'schedule'
+    environment: staging
+    env:
+      TF_VAR_environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure Azure credentials
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform plan
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}"
+          
+          terraform plan \
+            -var-file="environments/staging/terraform.tfvars" \
+            -out=tfplan
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-staging
+          path: terraform/tfplan
+          retention-days: 30
+
+      - name: Terraform cost estimation
+        uses: infracost/infracost-gh-action@v0.16
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          path: terraform/tfplan
+        env:
+          INFRACOST_ENABLE_CLOUD: true
+
+  # Build and test container images
+  build-images:
+    name: Build & Test Images
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        image: [burst-controller, monitoring, networking]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.CONTAINER_REGISTRY }}
+          username: ${{ secrets.CONTAINER_REGISTRY_USERNAME }}
+          password: ${{ secrets.CONTAINER_REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.CONTAINER_REGISTRY }}/federation-${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.image }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner on image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.CONTAINER_REGISTRY }}/federation-${{ matrix.image }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+  # Deploy to staging environment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [infrastructure-validation, build-images]
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    environment: staging
+    env:
+      TF_VAR_environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure cloud credentials
+        run: |
+          # AWS
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          
+          # Azure
+          az login --service-principal \
+            -u ${{ secrets.AZURE_CLIENT_ID }} \
+            -p ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+          
+          # GCP
+          echo '${{ secrets.GCP_SA_KEY }}' | base64 -d > /tmp/gcp-key.json
+          gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+
+      - name: Deploy infrastructure
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate"
+          
+          terraform apply -auto-approve \
+            -var-file="environments/staging/terraform.tfvars"
+
+      - name: Configure and deploy services
+        run: |
+          cd ansible
+          ansible-playbook -i inventory/staging \
+            playbooks/main.yml \
+            --vault-password-file=<(echo '${{ secrets.ANSIBLE_VAULT_PASSWORD }}')
+
+      - name: Run integration tests
+        run: |
+          cd tests/integration
+          python -m pytest -v --environment=staging
+
+      - name: Update deployment status
+        if: always()
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/deployments \
+            -d '{"ref":"${{ github.sha }}","environment":"staging","auto_merge":false}'
+
+  # Deploy to production environment
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+    env:
+      TF_VAR_environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Manual approval check
+        uses: hmarr/auto-approve-action@v3
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-deployment backup
+        run: |
+          # Backup critical data and configurations
+          ./scripts/backup-production.sh
+
+      - name: Blue-Green deployment preparation
+        run: |
+          # Prepare blue-green deployment
+          ./scripts/prepare-blue-green.sh
+
+      - name: Deploy to production
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=production/terraform.tfstate"
+          
+          terraform apply -auto-approve \
+            -var-file="environments/production/terraform.tfvars"
+
+      - name: Health check and validation
+        run: |
+          # Comprehensive health checks
+          ./scripts/health-check.sh production
+
+      - name: Update monitoring dashboards
+        run: |
+          # Update Grafana dashboards for production
+          ./scripts/update-monitoring.sh production
+
+      - name: Notify deployment success
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#federation-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Post-deployment monitoring and compliance
+  post-deployment:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for services to stabilize
+        run: sleep 300  # 5 minutes
+
+      - name: Run compliance checks
+        run: |
+          # SOC2, PCI-DSS, GDPR compliance validation
+          ./scripts/compliance-check.sh
+
+      - name: Performance baseline testing
+        run: |
+          # Load testing and performance benchmarks
+          ./scripts/performance-test.sh
+
+      - name: Security validation
+        run: |
+          # OWASP ZAP security testing
+          ./scripts/security-test.sh
+
+      - name: Generate deployment report
+        run: |
+          # Generate comprehensive deployment report
+          ./scripts/generate-report.sh
+
+      - name: Update documentation
+        run: |
+          # Auto-update deployment documentation
+          ./scripts/update-docs.sh
+
+  # Cleanup and maintenance
+  cleanup:
+    name: Cleanup & Maintenance
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Cleanup old artifacts
+        run: |
+          # Cleanup old container images, backups, etc.
+          ./scripts/cleanup.sh
+
+      - name: Update dependencies
+        run: |
+          # Update Terraform modules, Ansible collections, etc.
+          ./scripts/update-dependencies.sh
+
+      - name: Generate cost report
+        run: |
+          # Generate monthly cost analysis report
+          ./scripts/cost-analysis.sh
+
+# Job concurrency control
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true

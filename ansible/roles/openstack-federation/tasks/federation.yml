@@ -1,0 +1,210 @@
+---
+# Ansible Role: OpenStack Federation Configuration
+# Enterprise-grade federation setup with security best practices
+
+- name: Create federation service user
+  openstack.cloud.identity_user:
+    cloud: "{{ openstack_cloud_config }}"
+    name: "federation-service"
+    password: "{{ lookup('hashi_vault', 'secret=secret/cloud-federation/service-accounts:federation_password') }}"
+    email: "federation-service@{{ federation_domain }}"
+    domain: "{{ federation_domain_id }}"
+    enabled: yes
+    description: "Service account for federation operations"
+  register: federation_service_user
+
+- name: Create federation service project
+  openstack.cloud.project:
+    cloud: "{{ openstack_cloud_config }}"
+    name: "federation-services"
+    domain: "{{ federation_domain_id }}"
+    description: "Project for federation infrastructure services"
+    enabled: yes
+  register: federation_project
+
+- name: Create custom federation roles
+  openstack.cloud.identity_role:
+    cloud: "{{ openstack_cloud_config }}"
+    name: "{{ item.name }}"
+    description: "{{ item.description }}"
+  loop:
+    - name: "federation_admin"
+      description: "Administrator role for federation services"
+    - name: "burst_user"
+      description: "Role for users allowed to burst to public clouds"
+    - name: "cost_monitor"
+      description: "Role for cost monitoring and reporting"
+
+- name: Assign roles to federation service user
+  openstack.cloud.role_assignment:
+    cloud: "{{ openstack_cloud_config }}"
+    user: "{{ federation_service_user.user.id }}"
+    project: "{{ federation_project.project.id }}"
+    role: "{{ item }}"
+  loop:
+    - "admin"
+    - "federation_admin"
+
+- name: Configure Keystone for SAML federation
+  block:
+    - name: Install SAML dependencies
+      package:
+        name:
+          - xmlsec1
+          - xmlsec1-openssl
+        state: present
+      become: yes
+
+    - name: Generate SAML certificates
+      openssl_privatekey:
+        path: "/etc/keystone/ssl/saml_{{ item }}.key"
+        size: 2048
+        type: RSA
+      loop:
+        - signing
+        - encryption
+      become: yes
+
+    - name: Generate SAML certificate signing requests
+      openssl_csr:
+        path: "/etc/keystone/ssl/saml_{{ item }}.csr"
+        privatekey_path: "/etc/keystone/ssl/saml_{{ item }}.key"
+        common_name: "{{ openstack_fqdn }}"
+        subject_alt_name:
+          - "DNS:{{ openstack_fqdn }}"
+          - "DNS:keystone.{{ federation_domain }}"
+      loop:
+        - signing
+        - encryption
+      become: yes
+
+    - name: Generate self-signed SAML certificates
+      openssl_certificate:
+        path: "/etc/keystone/ssl/saml_{{ item }}.crt"
+        privatekey_path: "/etc/keystone/ssl/saml_{{ item }}.key"
+        csr_path: "/etc/keystone/ssl/saml_{{ item }}.csr"
+        provider: selfsigned
+        valid_for: "{{ certificate_validity_days | default(365) }}"
+      loop:
+        - signing
+        - encryption
+      become: yes
+
+- name: Configure Keystone federation settings
+  ini_file:
+    path: /etc/keystone/keystone.conf
+    section: "{{ item.section }}"
+    option: "{{ item.option }}"
+    value: "{{ item.value }}"
+    backup: yes
+  loop:
+    - section: federation
+      option: driver
+      value: sql
+    - section: federation
+      option: assertion_prefix
+      value: "https://{{ openstack_fqdn }}/v3/OS-FEDERATION/identity_providers"
+    - section: federation
+      option: remote_id_attribute
+      value: "HTTP_OIDC_ISS"
+    - section: saml
+      option: certfile
+      value: "/etc/keystone/ssl/saml_signing.crt"
+    - section: saml
+      option: keyfile
+      value: "/etc/keystone/ssl/saml_signing.key"
+    - section: saml
+      option: idp_entity_id
+      value: "https://{{ openstack_fqdn }}/v3/OS-FEDERATION/saml2/idp"
+    - section: saml
+      option: idp_sso_endpoint
+      value: "https://{{ openstack_fqdn }}/v3/OS-FEDERATION/saml2/sso"
+    - section: saml
+      option: idp_metadata_path
+      value: "/etc/keystone/saml2_idp_metadata.xml"
+  become: yes
+  notify: restart keystone
+
+- name: Create SAML IdP metadata template
+  template:
+    src: saml2_idp_metadata.xml.j2
+    dest: /etc/keystone/saml2_idp_metadata.xml
+    owner: keystone
+    group: keystone
+    mode: '0644'
+  become: yes
+
+- name: Configure federation networks
+  block:
+    - name: Create federation management network
+      openstack.cloud.network:
+        cloud: "{{ openstack_cloud_config }}"
+        name: "federation-mgmt-network"
+        description: "Management network for federation services"
+        project: "{{ federation_project.project.id }}"
+        shared: no
+        external: no
+        admin_state_up: yes
+
+    - name: Create federation management subnet
+      openstack.cloud.subnet:
+        cloud: "{{ openstack_cloud_config }}"
+        name: "federation-mgmt-subnet"
+        network_name: "federation-mgmt-network"
+        cidr: "{{ federation_mgmt_cidr | default('192.168.200.0/24') }}"
+        ip_version: 4
+        enable_dhcp: yes
+        dns_nameservers:
+          - "{{ dns_servers | default(['8.8.8.8', '8.8.4.4']) }}"
+        allocation_pool_start: "{{ federation_mgmt_cidr | ipaddr('host') | ipaddr('10') | ipaddr('address') }}"
+        allocation_pool_end: "{{ federation_mgmt_cidr | ipaddr('host') | ipaddr('250') | ipaddr('address') }}"
+
+- name: Configure security groups for federation
+  openstack.cloud.security_group:
+    cloud: "{{ openstack_cloud_config }}"
+    name: "federation-services-sg"
+    description: "Security group for federation services"
+    project: "{{ federation_project.project.id }}"
+  register: federation_sg
+
+- name: Configure security group rules
+  openstack.cloud.security_group_rule:
+    cloud: "{{ openstack_cloud_config }}"
+    security_group: "{{ federation_sg.secgroup.id }}"
+    protocol: "{{ item.protocol }}"
+    port_range_min: "{{ item.port_min }}"
+    port_range_max: "{{ item.port_max }}"
+    remote_ip_prefix: "{{ item.cidr }}"
+    direction: "{{ item.direction }}"
+    description: "{{ item.description }}"
+  loop:
+    - protocol: tcp
+      port_min: 443
+      port_max: 443
+      cidr: "0.0.0.0/0"
+      direction: ingress
+      description: "HTTPS for federation endpoints"
+    - protocol: tcp
+      port_min: 80
+      port_max: 80
+      cidr: "0.0.0.0/0"
+      direction: ingress
+      description: "HTTP redirect to HTTPS"
+    - protocol: tcp
+      port_min: 22
+      port_max: 22
+      cidr: "{{ management_cidr | default('10.0.0.0/8') }}"
+      direction: ingress
+      description: "SSH for management"
+    - protocol: tcp
+      port_min: 9090
+      port_max: 9100
+      cidr: "{{ federation_mgmt_cidr | default('192.168.200.0/24') }}"
+      direction: ingress
+      description: "Monitoring and metrics"
+    - protocol: icmp
+      port_min: -1
+      port_max: -1
+      cidr: "{{ federation_mgmt_cidr | default('192.168.200.0/24') }}"
+      direction: ingress
+      description: "ICMP for health checks"
