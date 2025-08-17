@@ -1,4 +1,4 @@
-# Enterprise Hybrid Cloud Federation Platform
+# Enterprise Hybrid Cloud Federation with OpenStack 
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Security](https://img.shields.io/badge/Security-Vault%20%2B%20Barbican-green.svg)](https://www.vaultproject.io/)
